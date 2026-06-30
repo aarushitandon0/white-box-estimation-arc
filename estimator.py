@@ -1,16 +1,27 @@
-"""Exact-covariance propagation estimator for the ARC White-Box Estimation
-Challenge 2026 (WhestBench).
+"""Exact-covariance propagation plus diagonal third-cumulant correction, for
+the ARC White-Box Estimation Challenge 2026 (WhestBench).
 
 Tracks the full (width x width) covariance matrix of hidden activations
-through every layer of a random ReLU MLP -- like the starter kit's
-`examples/03_covariance_propagation.py` baseline -- but replaces that
-baseline's heuristic "gain" approximation for the post-ReLU off-diagonal
-covariance with the *exact* value, derived in closed form via Price's
-theorem. See README.md for the full derivation and validation methodology.
+through every layer of a random ReLU MLP, like the starter kit's
+`covariance_propagation` baseline, but with two improvements over that
+baseline, both derived from first principles and validated against
+brute-force Monte Carlo before being trusted here. See README.md for the
+full derivations and validation methodology.
+
+1. The off-diagonal covariance between two neurons after a ReLU is computed
+   via its exact closed-form value (derived via Price's theorem), rather
+   than the baseline's heuristic "gain" approximation.
+2. A per-neuron diagonal third cumulant (skewness) is propagated in
+   parallel under an independence approximation, and used to apply a
+   first-order Gram-Charlier correction to the predicted mean at every
+   layer. The covariance matrix itself is left exactly as computed by (1);
+   only the recorded and propagated mean is corrected.
 
 To use: drop this file into a whest-starterkit checkout
 (https://github.com/AIcrowd/whest-starterkit) as `estimator.py`, replacing
-the stub, then run `uv run whest validate --estimator estimator.py`.
+the stub, then run `uv run whest validate --estimator estimator.py`. Score
+with `--runner subprocess` rather than `--runner local`; see README.md,
+"A measurement pitfall worth recording", for why.
 """
 
 from __future__ import annotations
@@ -47,9 +58,8 @@ _GL_WEIGHTS = [
 
 
 class Estimator(BaseEstimator):
-    """Full covariance propagation with the *exact* ReLU off-diagonal
-    covariance update (no gain-approximation). See README.md for the
-    derivation.
+    """Exact K=2 covariance propagation plus a diagonal K=3 (skewness)
+    mean correction. See README.md for both derivations.
     """
 
     def __init__(self) -> None:
@@ -66,6 +76,7 @@ class Estimator(BaseEstimator):
 
         mu = fnp.zeros(width)
         cov = fnp.eye(width)
+        kappa3 = fnp.zeros(width)  # per-neuron diagonal third cumulant (K=3, diagonal only)
         log_scale = 0.0
 
         rows = []
@@ -76,11 +87,16 @@ class Estimator(BaseEstimator):
                 s = float(fnp.sqrt(max_var_np))
                 mu = mu / s
                 cov = cov / (s * s)
+                # kappa3 has units of (activation)^3, so it rescales by s^3,
+                # consistent with the mean (s^1) and covariance (s^2).
+                kappa3 = kappa3 / (s * s * s)
                 log_scale += float(fnp.log(s))
 
-            # --- linear layer (exact) ---
+            # --- linear layer (exact mean/covariance; diagonal/independence
+            # approximation for the third-cumulant vector) ---
             mu_pre = w.T @ mu
             cov_pre = fnp.einsum("ij,ia,jb->ab", cov, w, w)
+            kappa3_pre = (w * w * w).T @ kappa3
 
             var_pre = fnp.maximum(fnp.diag(cov_pre), 1e-12)
             sigma_pre = fnp.sqrt(var_pre)
@@ -88,12 +104,35 @@ class Estimator(BaseEstimator):
             phi_alpha = flops.stats.norm.pdf(alpha)
             Phi_alpha = flops.stats.norm.cdf(alpha)
 
-            # --- post-ReLU marginal mean/variance (exact per neuron) ---
-            mu_post = mu_pre * Phi_alpha + sigma_pre * phi_alpha
+            # --- post-ReLU marginal moments (exact per neuron, Gaussian case) ---
+            mu_post_gauss = mu_pre * Phi_alpha + sigma_pre * phi_alpha
             ez2 = (mu_pre * mu_pre + var_pre) * Phi_alpha + mu_pre * sigma_pre * phi_alpha
-            var_post = fnp.maximum(ez2 - mu_post * mu_post, 0.0)
+            ez3 = (mu_pre * mu_pre * mu_pre + 3.0 * mu_pre * var_pre) * Phi_alpha + (
+                mu_pre * mu_pre * sigma_pre + 2.0 * sigma_pre * var_pre
+            ) * phi_alpha
 
-            # --- post-ReLU off-diagonal covariance (exact, via quadrature) ---
+            # --- first-order Gram-Charlier (skewness) correction, derived
+            # from a second application of the same Hermite-integral
+            # technique used for the off-diagonal covariance formula below.
+            # See README.md for the closed-form derivation.
+            C1 = -(kappa3_pre * alpha) / (6.0 * var_pre) * phi_alpha
+            C2 = -(kappa3_pre) / (6.0 * sigma_pre) * phi_alpha
+            C3 = kappa3_pre * (0.5 * Phi_alpha - alpha * phi_alpha)
+
+            mu_post = mu_post_gauss + C1
+            ez2_corrected = ez2 + C2
+            ez3_corrected = ez3 + C3
+            kappa3_post = (
+                ez3_corrected
+                - 3.0 * mu_post * ez2_corrected
+                + 2.0 * mu_post * mu_post * mu_post
+            )
+
+            # --- post-ReLU covariance matrix (exact K=2; unaffected by the
+            # skew correction above -- diagonal and off-diagonal both come
+            # from the Gaussian-closure formulas, as validated) ---
+            var_post = fnp.maximum(ez2 - mu_post_gauss * mu_post_gauss, 0.0)
+
             sigma_outer = fnp.outer(sigma_pre, sigma_pre)
             rho = fnp.clip(cov_pre / sigma_outer, -1.0 + 1e-7, 1.0 - 1e-7)
             a = fnp.outer(alpha, fnp.ones(width))  # a[i,j] = alpha[i]
@@ -114,6 +153,7 @@ class Estimator(BaseEstimator):
             fnp.fill_diagonal(cov, var_post)
 
             mu = mu_post
+            kappa3 = kappa3_post
             scale_factor = float(fnp.exp(log_scale))
             rows.append(mu * scale_factor)
 

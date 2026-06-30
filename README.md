@@ -5,11 +5,13 @@ per-neuron post-ReLU activation under standard normal input, without running
 the network thousands of times to average the answer empirically.
 
 The estimator implemented here improves on the official starter kit's bundled
-`covariance_propagation` baseline by replacing one specific approximation,
-the off-diagonal covariance between two neurons after a ReLU nonlinearity,
-with its exact closed-form value. The formula is derived from first
-principles below and validated against brute-force Monte Carlo sampling
-before being trusted in the estimator itself.
+`covariance_propagation` baseline in two ways: by replacing one specific
+approximation, the off-diagonal covariance between two neurons after a ReLU
+nonlinearity, with its exact closed-form value; and by adding a diagonal
+third-cumulant (skewness) correction to the predicted mean at each layer.
+Both are derived from first principles below and validated against
+brute-force Monte Carlo sampling before being trusted in the estimator
+itself.
 
 ## Table of contents
 
@@ -20,12 +22,13 @@ before being trusted in the estimator itself.
 5. [Numerical evaluation](#numerical-evaluation)
 6. [Implementation](#implementation)
 7. [Validation](#validation)
-8. [Results](#results)
-9. [Repository structure](#repository-structure)
-10. [Usage](#usage)
-11. [Limitations and future work](#limitations-and-future-work)
-12. [References](#references)
-13. [License](#license)
+8. [Extension: diagonal third-cumulant correction](#extension-diagonal-third-cumulant-correction)
+9. [Results](#results)
+10. [Repository structure](#repository-structure)
+11. [Usage](#usage)
+12. [Limitations and future work](#limitations-and-future-work)
+13. [References](#references)
+14. [License](#license)
 
 ## Problem statement
 
@@ -393,47 +396,162 @@ confirmed independently at the formula level above), and an honest account of
 where the gain in this approach is and is not realized is more useful than a
 selectively favorable comparison.
 
+## Extension: diagonal third-cumulant correction
+
+The off-diagonal covariance formula above leaves the Gaussian-closure
+assumption itself untouched: every layer's pre-activation vector is still
+treated as exactly multivariate Gaussian, when in reality each ReLU
+introduces skewness that compounds across the network's 32 layers. The
+estimator closes part of this gap with a second, independent correction: a
+per-neuron diagonal third cumulant (skewness), propagated through linear
+layers under an independence approximation analogous to the one mean
+propagation makes for variance, used to apply a first-order Gram-Charlier
+correction to the predicted mean at every layer. The covariance matrix
+itself, both diagonal and off-diagonal, is left exactly as computed by the
+K=2 method above; only the recorded and propagated mean is corrected.
+
+### Derivation
+
+For a pre-activation `Z` with mean `mu`, standard deviation `sigma`, and
+third cumulant `kappa3`, a first-order Gram-Charlier expansion of `Z`'s
+density adds a correction term proportional to `kappa3` to the density of
+the standardized Gaussian. Integrating `z * 1{z > 0}` against this corrected
+density, using the same kind of Hermite-integral technique used for the
+off-diagonal covariance formula above, gives a closed-form correction to
+`E[ReLU(Z)]`:
+
+```
+alpha = mu / sigma
+E[ReLU(Z)]  ~=  mu * Phi(alpha) + sigma * phi(alpha)  -  (kappa3 * alpha) / (6 * sigma^2) * phi(alpha)
+```
+
+with similar closed-form correction terms derived for `E[ReLU(Z)^2]` and
+`E[ReLU(Z)^3]`, the latter needed to estimate the post-ReLU third cumulant to
+propagate to the next layer (via the standard moment-to-cumulant relation
+`kappa3 = mu3' - 3 mu1' mu2' + 2 mu1'^3` applied to the corrected raw
+moments). Propagating the third cumulant itself through a linear layer under
+the independence approximation costs only `O(n^2)` per layer:
+
+```
+kappa3_pre[a] = sum_i W[i, a]^3 * kappa3_h[i]
+```
+
+### Validation
+
+This was checked in two stages against brute-force Monte Carlo, mirroring
+the methodology used for the off-diagonal covariance formula, reproducible
+via `validate_skew_correction.py`:
+
+- Stage A isolated the moment-correction formulas: given the *true*
+  (sampled) kappa3 of a real network's pre-activations as input, the
+  skew-corrected mean formula reduced the mean absolute error against
+  sampled ground truth by a consistent factor of roughly 2 to 5 times across
+  five test layers, relative to the plain Gaussian formula, once the
+  pre-activation had any measurable skewness.
+- Stage B tested the full estimator end to end, comparing K=2-only against
+  K=2 plus the diagonal third-cumulant correction, against a low-noise Monte
+  Carlo reference. At small scale (width 16, depth 6, five seeds), the
+  correction reduced final-layer MSE to 69 percent of the K=2-only value on
+  average (four of five seeds improved). At the actual competition shape
+  (width 256, depth 32, three seeds), it reduced final-layer MSE to 82
+  percent of the K=2-only value on average, with all three seeds improving.
+
+Both stages confirm the correction is mathematically sound and genuinely
+reduces raw mean squared error, including at the competition's exact network
+shape.
+
+### A measurement pitfall worth recording
+
+The correction's extra arithmetic is cheap in raw FLOPs (it added well under
+1 percent to the estimator's analytical FLOP count). Despite this, an
+initial scoring attempt with `whest run --runner local` on the development
+machine used for this repository showed the *adjusted* competition score
+getting worse, not better, across two separate runs: raw final-layer MSE
+fell from `7.82e-05` to `6.56e-05` as expected, but the adjusted score rose
+from `7.85e-06` to between `1.09e-05` and `1.87e-05`. The scoring formula's
+compute-usage multiplier, `max(0.1, C_m / B_m)`, is sensitive to residual
+wall-clock time outside the dominant matrix multiplications, and that time
+appeared to roughly double under `--runner local`, pushing compute
+utilization from about 8 percent of budget to between 17 and 29 percent.
+
+Before accepting that as a real property of the estimator, two checks were
+run. First, profiling the two estimators with `cProfile` on identical input
+showed only a 5 to 7 percent difference in Python-level call overhead
+between them, not the 2.5 to 3.5 times difference the `whest run` reports
+implied. Second, re-scoring both estimators with `whest run --runner
+subprocess`, which isolates each network's evaluation in its own process and
+is explicitly documented as closer to the grader's actual behavior, resolved
+the discrepancy: the K=2-only estimator scored `7.89e-06` under subprocess
+isolation, consistent with its `--runner local` result of `7.85e-06`, while
+the K=2 plus diagonal-K=3 estimator scored `6.71e-06`, a genuine 15 percent
+improvement. The `--runner local` result was concluded to be measurement
+noise specific to this development machine (likely from sustained wall-clock
+timing being more exposed to OS-level scheduling jitter as cumulative
+process runtime grows), not a real property of the correction, and the
+correction was adopted into the submitted estimator on that basis.
+
+This is recorded here because it generalizes: on this competition, a
+correction's raw FLOP cost is not the only thing worth checking before
+trusting a local benchmark, since the scoring formula also prices in
+wall-clock time outside instrumented operations, and that quantity can be
+measurably noisier under some local harness configurations than under
+others. `--runner subprocess` is recommended over `--runner local` for any
+timing-sensitive comparison, not only as a contract-correctness check.
+
 ## Results
 
-The estimator was run against the official public Mini split of the Phase 1
-dataset (100 randomly generated networks, width 256, depth 32) using the
-starter kit's own grading pipeline, `whest run`, rather than only the
-internal comparisons above:
+The estimator (K=2 exact off-diagonal covariance plus the diagonal K=3
+correction described above) was run against the official public Mini split
+of the Phase 1 dataset (100 randomly generated networks, width 256, depth
+32) using the starter kit's own grading pipeline, `whest run --runner
+subprocess`, for the reasons given in "A measurement pitfall worth
+recording" above:
 
 | Metric | Value |
 |---|---|
-| Adjusted final-layer score (primary metric) | 7.85e-06 |
-| Raw final-layer MSE | 7.82e-05 |
-| All-layers MSE | 5.23e-05 |
-| Best single-network adjusted score | 1.67e-06 |
-| Worst single-network adjusted score | 3.45e-05 |
-| Mean compute utilization | 8.06 percent of budget |
-| Mean score multiplier | 0.1003 |
+| Adjusted final-layer score (primary metric) | 6.71e-06 |
+| Raw final-layer MSE | 6.56e-05 |
+| All-layers MSE | 4.30e-05 |
+| Best single-network adjusted score | 1.54e-06 |
+| Worst single-network adjusted score | 2.67e-05 |
+| Mean compute utilization | 9.35 percent of budget |
+| Mean score multiplier | 0.1022 |
 | Failed networks | 0 of 100 |
 
-For comparison, the organizers' own published figure for the bundled
-`covariance_propagation` baseline at a comparable network shape reports a
-final-layer mean squared error of approximately 8.4e-05, which this
-estimator's official scored result of 7.82e-05 sits modestly below.
+For comparison, the K=2-only estimator (without the diagonal third-cumulant
+correction) scores `7.89e-06` adjusted / `7.82e-05` raw under the same
+`--runner subprocess` conditions, and the organizers' own published figure
+for the bundled `covariance_propagation` baseline at a comparable network
+shape reports a final-layer mean squared error of approximately `8.4e-05`.
+The progression mean propagation, baseline covariance propagation, exact
+off-diagonal covariance, exact covariance plus diagonal skewness correction
+is a monotonic improvement at every step measured so far.
 
 ## Repository structure
 
 ```
 .
-├── estimator.py                  the submission, written against the
-│                                  whest-starterkit contract
-├── validate_relu_covariance.py   standalone proof of correctness for the
-│                                  closed-form covariance formula, checked
-│                                  against brute-force Monte Carlo
-├── README.md                     this file
-├── LICENSE                       MIT license
+├── estimator.py                   the submission, written against the
+│                                   whest-starterkit contract
+├── validate_relu_covariance.py    standalone proof of correctness for the
+│                                   closed-form off-diagonal covariance
+│                                   formula, checked against brute-force
+│                                   Monte Carlo
+├── validate_skew_correction.py    standalone proof of correctness for the
+│                                   diagonal third-cumulant correction,
+│                                   checked against brute-force Monte Carlo
+│                                   (both the marginal moment formulas and
+│                                   the full estimator end to end)
+├── README.md                      this file
+├── LICENSE                        MIT license
 └── .gitignore
 ```
 
-`validate_relu_covariance.py` has no dependency on flopscope, whestbench, or
-any part of the starter kit. It depends only on NumPy and is meant to be
-read and re-run independently of the competition harness, as a check on the
-mathematics rather than as part of the submission itself.
+`validate_relu_covariance.py` and `validate_skew_correction.py` have no
+dependency on flopscope, whestbench, or any part of the starter kit. They
+depend only on NumPy and are meant to be read and re-run independently of
+the competition harness, as checks on the mathematics rather than as part of
+the submission itself.
 
 ## Usage
 
@@ -450,13 +568,17 @@ cp /path/to/this/repository/estimator.py .
 uv run whest validate --estimator estimator.py
 uv run whest run --estimator estimator.py \
     --dataset hf://aicrowd/arc-whestbench-public-2026@v1-phase1 \
-    --split mini --runner local
+    --split mini --runner subprocess
 ```
 
-To re-run the independent formula validation, which requires only NumPy:
+`--runner subprocess` is used deliberately rather than `--runner local`; see
+"A measurement pitfall worth recording" above.
+
+To re-run the independent formula validations, which require only NumPy:
 
 ```bash
 python validate_relu_covariance.py
+python validate_skew_correction.py
 ```
 
 ## Limitations and future work
@@ -464,15 +586,20 @@ python validate_relu_covariance.py
 The validation results above show that the exact off-diagonal covariance
 formula, while mathematically correct and a strict theoretical improvement
 over the gain approximation, is not the dominant source of remaining error
-at the competition's network scale. Both this estimator and the baseline it
-improves on assume that each layer's pre-activation vector is well
-approximated as multivariate Gaussian, an approximation sometimes called
-Gaussian closure. That assumption degrades with depth, since each ReLU
-layer's output is not actually Gaussian, and approximation error compounds
-across the network's 32 layers. Closing this remaining gap requires tracking
-higher-order statistics, such as skewness (the third cumulant) and kurtosis
-(the fourth cumulant), through each layer rather than only the first two
-moments.
+at the competition's network scale on its own. Both this estimator and the
+baseline it improves on assume that each layer's pre-activation vector is
+well approximated as multivariate Gaussian, an approximation sometimes
+called Gaussian closure. That assumption degrades with depth, since each
+ReLU layer's output is not actually Gaussian, and approximation error
+compounds across the network's 32 layers. The diagonal third-cumulant
+correction above closes part of this gap (a genuine ~15 percent reduction in
+adjusted score) by tracking per-neuron skewness, but it deliberately ignores
+the off-diagonal third cumulant between neurons, the same kind of
+cross-neuron structure whose omission was the gap between mean propagation
+and full covariance propagation at the K=2 level. Closing the remaining gap
+requires tracking the full higher-order cumulant tensors, including
+off-diagonal terms, and going further still to the fourth cumulant
+(kurtosis), rather than only diagonal third-order statistics.
 
 The challenge's companion paper, Wu et al. (2026), develops exactly this:
 a general algorithm for propagating cumulants of arbitrary order `K` through
