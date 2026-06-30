@@ -1,7 +1,5 @@
-# Exact-Covariance Propagation for the ARC White-Box Estimation Challenge 2026
-
-This repository contains an estimator submitted to ARC's WhestBench / White-Box
-Estimation Challenge 2026. The challenge asks: given only the weights of a
+# Exact-Covariance Propagation 
+The challenge asks: given only the weights of a
 randomly initialized ReLU multilayer perceptron, predict the expected
 per-neuron post-ReLU activation under standard normal input, without running
 the network thousands of times to average the answer empirically.
@@ -12,8 +10,6 @@ the off-diagonal covariance between two neurons after a ReLU nonlinearity,
 with its exact closed-form value. The formula is derived from first
 principles below and validated against brute-force Monte Carlo sampling
 before being trusted in the estimator itself.
-
-Challenge page: https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026
 
 ## Table of contents
 
